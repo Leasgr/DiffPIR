@@ -1,3 +1,17 @@
+# main_ddpir.py
+#
+# Point d'entrée principal de DiffPIR (version configurable via fichier YAML).
+# Supporte les trois tâches : super-résolution ('sr'), défloutage ('deblur'), inpainting ('inpaint').
+# Utilisation : python main_ddpir.py --opt options/config.yaml
+#
+# La configuration est chargée depuis un fichier YAML passé via --opt.
+# Voir parse_args_and_config() pour la liste complète des paramètres YAML attendus.
+#
+# Différence avec les scripts autonomes (main_ddpir_deblur.py, etc.) :
+#   - Utilise un DataLoader PyTorch (batch processing) pour efficacité
+#   - Toutes les tâches sont dans un seul script, sélectionnées par config.task
+#   - Les hyperparamètres sont dans un fichier YAML, pas codés en dur
+
 import os.path
 import cv2
 import logging
@@ -36,6 +50,10 @@ from guided_diffusion.script_util import (
 )
 
 class CustomDataset(Dataset):
+    '''Dataset PyTorch qui charge et dégrade les images à la volée.
+    Prend en charge les trois tâches selon config.task.
+    Retourne (img_H, img_L, img_name, k, mask) pour chaque image.
+    '''
     def __init__(self, img_paths, config):
         self.img_paths = img_paths
         self.config = config
@@ -47,7 +65,7 @@ class CustomDataset(Dataset):
         img_path = self.img_paths[idx]
 
         # --------------------------------
-        # load kernel
+        # Chargement du noyau de dégradation
         # --------------------------------
 
         if self.config.task == "sr":
@@ -117,6 +135,9 @@ class CustomDataset(Dataset):
         return img_H, img_L, img_name, k, mask
 
 class Config:
+    '''Convertit un dictionnaire YAML imbriqué en objet Python avec attributs accessibles.
+    Ex : config['task'] → config.task, config['blur']['mode'] → config.blur.mode.
+    '''
     def __init__(self, dictionary):
         for k, v in dictionary.items():
             if isinstance(v, dict):
@@ -125,24 +146,85 @@ class Config:
                 setattr(self, k, v)
 
 def parse_args_and_config():
+    '''
+    Charge le fichier YAML passé via --opt et calcule les chemins et paramètres dérivés.
+
+    Paramètres YAML attendus (liste complète) :
+    ─────────────────────────────────────────────
+    Général :
+      task             : tâche à effectuer ('sr', 'deblur', 'inpaint')
+      model_name       : nom du checkpoint ('diffusion_ffhq_10m' ou '256x256_diffusion_uncond')
+      testset_name     : nom du dossier de test dans testsets/
+      seed             : graine aléatoire pour la reproductibilité
+      n_channels       : nombre de canaux (3 pour RGB)
+      cwd              : répertoire racine ('' = courant)
+      batch_size       : taille du batch pour le DataLoader
+
+    Bruit :
+      noise_level_img  : niveau de bruit AWGN sur l'image dégradée (en [0,255], converti en [0,1])
+      noise_init_img   : niveau de bruit pour initialiser x_t ('max' = bruit pur, ou valeur float)
+
+    Diffusion :
+      num_train_timesteps : nombre de pas T de la diffusion (1000, fixe)
+      beta_start          : début du schedule linéaire β (0.0001)
+      beta_end            : fin du schedule linéaire β (0.02)
+      iter_num            : nombre de pas de diffusion inverse (NFE, ex: 20-100)
+      iter_num_U          : nombre d'itérations internes par pas (défaut 1)
+      skip_type           : espacement des pas ('uniform' ou 'quad')
+      skip_noise_model_t  : si True, calcule noise_model_t depuis noise_level_model
+
+    Algorithme DiffPIR :
+      generate_mode    : 'DiffPIR', 'DPS_y0', 'DPS_yt', 'repaint', 'vanilla'
+      model_output_type: 'pred_xstart', 'pred_x_prev', 'epsilon', 'score'
+      sub_1_analytic   : True = solveur FFT, False = gradient de premier ordre
+      ddim_sample      : True = DDIM, False = DDPM
+      eta              : stochasticité DDIM (0 = déterministe, 1 = DDPM)
+      zeta             : mélange bruit déterministe/stochastique (0 à 1)
+      lambda_          : poids du terme de données (régularisation HQS)
+      guidance_scale   : force de la correction par les données (défaut 1.0)
+
+    Métriques :
+      calc_LPIPS       : calculer la métrique LPIPS (True/False)
+
+    Super-résolution (task='sr') :
+      sf               : facteur d'échelle (2, 3 ou 4)
+      sr_mode          : 'blur' (dégradation classique) ou 'cubic' (bicubique)
+      inIter           : itérations IBP pour sr_mode='cubic'
+      gamma            : pas de l'IBP pour sr_mode='cubic'
+
+    Défloutage (task='deblur') :
+      blur_mode        : 'Gaussian' ou 'motion'
+      kernel_size      : taille du noyau en pixels
+      use_DIY_kernel   : True = noyau aléatoire, False = noyau fixe depuis Levin09.mat
+
+    Inpainting (task='inpaint') :
+      mask_type        : 'box', 'random', 'both', 'extreme'
+      mask_len_range   : [min, max] taille du rectangle (pour 'box')
+      mask_prob_range  : [min, max] probabilité de masquage (pour 'random')
+      load_mask        : True = charge un masque depuis mask_path
+      mask_path        : chemin vers l'image masque (si load_mask=True)
+
+    Sauvegarde :
+      save_E           : sauvegarder les images restaurées
+      save_L           : sauvegarder les images dégradées
+    ─────────────────────────────────────────────
+    '''
     parser = argparse.ArgumentParser()
     parser.add_argument("--opt", type=str, help="Path to option YMAL file.")
     args = parser.parse_args()
-    # Load the YAML file
     with open(args.opt, 'r') as file:
         config = yaml.safe_load(file)
     config = Config(config)
     config.world_size = torch.cuda.device_count()
     config.opt = args.opt
 
-    config.noise_level_img = config.noise_level_img / 255. # noise level of noisy image
-    # config.skip = config.num_train_timesteps // config.iter_num     # skip interval
-    config.noise_level_model = config.noise_level_img   # set noise level of model, default: 0
-    config.sigma = max(0.001, config.noise_level_img)  # noise level associated with condition y
-    # paths
-    config.model_zoo = os.path.join(config.cwd, 'model_zoo')    # fixed
-    config.testsets = os.path.join(config.cwd, 'testsets')     # fixed
-    config.results = os.path.join(config.cwd, 'results')      # fixed
+    config.noise_level_img = config.noise_level_img / 255.  # convertit de [0,255] en [0,1]
+    config.noise_level_model = config.noise_level_img
+    config.sigma = max(0.001, config.noise_level_img)  # évite division par zéro dans rho
+    # Chemins fixes (ne pas modifier)
+    config.model_zoo = os.path.join(config.cwd, 'model_zoo')
+    config.testsets = os.path.join(config.cwd, 'testsets')
+    config.results = os.path.join(config.cwd, 'results')
     config.result_name = f'{config.testset_name}_{config.task}_{config.generate_mode}_{config.model_name}_sigma{config.noise_level_img}_NFE{config.iter_num}_eta{config.eta}_zeta{config.zeta}_lambda{config.lambda_}'
     if config.task == "sr":
         config.result_name += f'_{config.sr_mode}{str(config.sf)}'
@@ -154,17 +236,17 @@ def parse_args_and_config():
         assert config.generate_mode in ['DiffPIR', 'repaint', 'vanilla']
 
     config.model_path = os.path.join(config.model_zoo, config.model_name+'.pt')
-    config.L_path = os.path.join(config.testsets, config.testset_name) # L_path, for Low-quality images
-    config.E_path = os.path.join(config.results, config.result_name)   # E_path, for Estimated images
+    config.L_path = os.path.join(config.testsets, config.testset_name)
+    config.E_path = os.path.join(config.results, config.result_name)
     util.mkdir(config.E_path)
 
-    # set random seed everywhere
+    # Fixe toutes les graines aléatoires pour la reproductibilité
     torch.manual_seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.seed)
-        torch.cuda.manual_seed_all(config.seed)  # for multi-GPU.
-    np.random.seed(config.seed)  # Numpy module.
-    random.seed(config.seed)  # Python random module.
+        torch.cuda.manual_seed_all(config.seed)
+    np.random.seed(config.seed)
+    random.seed(config.seed)
     torch.manual_seed(config.seed)
     return config
 
@@ -180,24 +262,35 @@ def main():
     config.device = device
     L_paths = util.get_image_paths(config.L_path)
 
-    # schedule
+    # ----------------------------------------
+    # Calendrier de bruit (noise schedule) linéaire DDPM
+    # β_t croit linéairement de beta_start à beta_end sur num_train_timesteps pas.
+    # reduced_alpha_cumprod[t] ≈ σ équivalente à l'instant t (utilisée pour mapper
+    # un niveau de bruit vers un pas de temps discret).
+    # ----------------------------------------
     betas = np.linspace(config.beta_start, config.beta_end, config.num_train_timesteps, dtype=np.float32)
     betas                   = torch.from_numpy(betas).to(device)
     alphas                  = 1.0 - betas
     alphas_cumprod          = np.cumprod(alphas.cpu(), axis=0)
     sqrt_alphas_cumprod     = torch.sqrt(alphas_cumprod)
     sqrt_1m_alphas_cumprod  = torch.sqrt(1. - alphas_cumprod)
-    reduced_alpha_cumprod   = torch.div(sqrt_1m_alphas_cumprod, sqrt_alphas_cumprod)        # equivalent noise sigma on image
+    # σ équivalente sur l'image : ratio √(1-ᾱ_t)/√ᾱ_t, croissant avec t
+    reduced_alpha_cumprod   = torch.div(sqrt_1m_alphas_cumprod, sqrt_alphas_cumprod)
 
+    # noise_model_t : pas à partir duquel on désactive la correction par les données.
+    # Quand σ_résiduelle < σ_image, le modèle n'a plus d'avantage à corriger.
     if config.skip_noise_model_t:
         config.noise_model_t = utils_model.find_nearest(reduced_alpha_cumprod, 2 * config.noise_level_model)
     else:
-        config.noise_model_t = 0
+        config.noise_model_t = 0  # désactivé : correction active jusqu'au bout
 
+    # t_start : pas de temps initial (point de départ de la diffusion inverse).
+    # 'max' = départ depuis bruit pur (t=999), explorant tout l'espace latent.
+    # Valeur numérique = départ depuis le niveau de bruit correspondant (plus rapide).
     if config.noise_init_img == 'max':
-        config.t_start = config.num_train_timesteps - 1   
+        config.t_start = config.num_train_timesteps - 1
     else:
-        config.t_start = utils_model.find_nearest(reduced_alpha_cumprod, 2 * config.noise_init_img / 255) # start timestep of the diffusion process
+        config.t_start = utils_model.find_nearest(reduced_alpha_cumprod, 2 * config.noise_init_img / 255)
 
     # set up logger
     logger_name = config.result_name
@@ -216,6 +309,9 @@ def main():
     # load model
     # ----------------------------------------
 
+    # Architecture U-Net selon le checkpoint :
+    #   diffusion_ffhq_10m      → modèle léger (≈10M params), adapté aux visages 256×256
+    #   256x256_diffusion_uncond → modèle large (≈550M params), adapté à ImageNet
     model_config = dict(
             model_path=config.model_path,
             num_channels=128,
@@ -234,7 +330,8 @@ def main():
     model.load_state_dict(torch.load(args.model_path, map_location="cpu"))
     model.eval()
     if config.generate_mode != 'DPS_y0':
-        # for DPS_yt, we can avoid backward through the model
+        # DPS_y0 nécessite les gradients du modèle pour la guidance.
+        # Pour tous les autres modes, on désactive les gradients pour économiser la mémoire.
         for k, v in model.named_parameters():
             v.requires_grad = False
     model = model.to(device)
@@ -246,7 +343,10 @@ def main():
     # main function
     # ----------------------------------------
 
-    def test_rho(config): 
+    def test_rho(config):
+        '''Exécute l'inférence DiffPIR pour les hyperparamètres courants (lambda_, zeta, etc.).
+        Cette fonction est appelée en boucle pour balayer différentes valeurs de lambda_.
+        '''
         parameters = f'eta:{config.eta}, zeta:{config.zeta}, lambda:{config.lambda_}, guidance_scale:{config.guidance_scale}'
         parameters = parameters + f', inIter:{config.inIter}, gamma:{config.gamma}' if (config.task == "sr" and config.sr_mode == 'cubic') else parameters
         logger.info(parameters)
@@ -261,48 +361,56 @@ def main():
             batch_size = batch[0].shape[0]
             C, H, W = batch[0].shape[3], batch[0].shape[1], batch[0].shape[2]
             img_H, img_L, names, k, mask = batch
-            # convert to numpy
+            # Conversion en numpy pour les opérations spatiales
             img_H = img_H.numpy()
             img_L = img_L.numpy()
             k = k.numpy()
             mask = mask.numpy()
             
             # --------------------------------
-            # (2) get rhos and sigmas
-            # -------------------------------- 
-            
-            sigmas = []
-            sigma_ks = []
-            rhos = []
+            # (2) Calcul des rhos et sigmas pour chaque pas de temps
+            # rho[t] = λσ²/σ_k[t]² : poids du terme de données dans HQS à l'instant t.
+            # Un rho grand → la solution des données domine (forte fidélité à y).
+            # Un rho petit → le prior du modèle domine (liberté hallucinatoire).
+            # --------------------------------
+
+            sigmas = []    # niveaux de bruit décroissants (de t=999 à t=0)
+            sigma_ks = []  # variance conditionnelle de x0 sachant x_t
+            rhos = []      # paramètre de régularisation HQS à chaque pas
             for i in range(config.num_train_timesteps):
                 sigmas.append(reduced_alpha_cumprod[config.num_train_timesteps-1-i])
                 if model_out_type == 'pred_xstart' and config.generate_mode == 'DiffPIR':
+                    # Formule DiffPIR : σ_k = √(1-ᾱ_t)/√ᾱ_t (variance du décodeur)
                     sigma_ks.append((sqrt_1m_alphas_cumprod[i]/sqrt_alphas_cumprod[i]))
-                #elif model_out_type == 'pred_x_prev':
                 else:
+                    # Formule alternative (pred_x_prev) : σ_k = √(β_t/α_t)
                     sigma_ks.append(torch.sqrt(betas[i]/alphas[i]))
                 rhos.append(config.lambda_*(config.sigma**2)/(sigma_ks[i]**2))
-                    
+
             rhos, sigmas, sigma_ks = torch.tensor(rhos).to(config.device), torch.tensor(sigmas).to(config.device), torch.tensor(sigma_ks).to(config.device)
             
             # --------------------------------
-            # (3) initialize x, and pre-calculation
+            # (3) Initialisation de x_t et pré-calcul FFT
             # --------------------------------
-            y = util.single2tensor4_batch(img_L).to(config.device)   #(1,3,256,256) [0,1]
+            y = util.single2tensor4_batch(img_L).to(config.device)  # observation y ∈ [0,1], (B,3,H,W)
 
             if config.task == "sr":
+                # Opérateur de dégradation : Resizer implémente le sous-échantillonnage bicubique
                 degrade_op = Resizer((batch_size, C, H, W), 1/config.sf).to(config.device)
-                x = F.interpolate(torch.from_numpy(img_L).permute(0, 3, 1, 2), size=(img_L.shape[1]*config.sf, img_L.shape[2]*config.sf), mode='bicubic', align_corners=False).to(config.device)
+                # Initialisation bicubique : x interpolé à la résolution HR (meilleur point de départ)
+                x = F.interpolate(torch.from_numpy(img_L).permute(0, 3, 1, 2),
+                                  size=(img_L.shape[1]*config.sf, img_L.shape[2]*config.sf),
+                                  mode='bicubic', align_corners=False).to(config.device)
                 if config.sr_mode == 'cubic':
                     up_sample = partial(F.interpolate, scale_factor=config.sf)
             elif config.task == "deblur":
                 util.imsave_batch(k*255.*200, names, config.E_path, 'motion_kernel_')
-                #np.save(os.path.join(E_path, 'motion_kernel.npy'), k)
                 k_4d = torch.from_numpy(k).to(device)
-                k_4d = k_4d.unsqueeze(1)    # B, 1, H, W
+                k_4d = k_4d.unsqueeze(1)  # (B, 1, H, W) : noyau identique pour chaque canal
                 x = y
+                # Opérateur de flou : convolution avec padding réflexif (évite les artefacts de bords)
                 def degrade_op(x):
-                    x = x / 2 + 0.5
+                    x = x / 2 + 0.5  # convertit en [0,1] pour la convolution
                     pad_2d = torch.nn.ReflectionPad2d(k.shape[0]//2)
                     x_blurs = []
                     for i in range(x.shape[0]):
@@ -311,49 +419,55 @@ def main():
             elif config.task == 'inpaint':
                 img_L = img_L * mask
                 mask = util.single2tensor4_batch(mask.astype(np.float32)).to(device)
-                x = y * mask
+                x = y * mask  # pixels inconnus initialisés à 0
+
+            # Bruite x au niveau t_start : mélange x avec du bruit gaussien
+            # pour cohérence avec la distribution q(x_t | x_0) à l'instant t_start.
             x = sqrt_alphas_cumprod[config.t_start] * (2*x-1) + sqrt_1m_alphas_cumprod[config.t_start] * torch.randn_like(x)
-            # x = torch.randn_like(x)
 
             if config.task in ['sr', 'deblur']:
-                k_tensor = util.single2tensor4_batch(np.expand_dims(k, 3)).to(config.device) 
+                # Pré-calcul FFT des matrices nécessaires à data_solution (fait une seule fois)
+                k_tensor = util.single2tensor4_batch(np.expand_dims(k, 3)).to(config.device)
                 FB, FBC, F2B, FBFy = sr.pre_calculate(y, k_tensor, config.sf)
 
             # --------------------------------
-            # (4) main iterations
+            # (4) Boucle principale de diffusion inverse DiffPIR
+            # Alterne : (Étape 1) débruitage par le U-Net → (Étape 2) correction par données
             # --------------------------------
 
-            # create sequence of timestep for sampling
+            # Construction de la séquence de pas de temps échantillonnés
             skip = config.num_train_timesteps // config.iter_num
             if config.skip_type == 'uniform':
+                # Espacement régulier : t = 0, skip, 2*skip, ...
                 seq = [i*skip for i in range(config.iter_num)]
                 if skip > 1:
                     seq.append(config.num_train_timesteps-1)
             elif config.skip_type == "quad":
+                # Espacement quadratique : concentre plus de pas aux niveaux de bruit élevés
                 seq = np.sqrt(np.linspace(0, config.num_train_timesteps**2, config.iter_num))
                 seq = [int(s) for s in list(seq)]
                 seq[-1] = seq[-1] - 1
             progress_seq = seq[::max(len(seq)//10,1)]
             if progress_seq[-1] != seq[-1]:
                 progress_seq.append(seq[-1])
-            
-            # reverse diffusion for one image from random noise
+
+            # Boucle de diffusion inverse (de t_start vers t=0)
             for i in range(len(seq)):
                 curr_sigma = sigmas[seq[i]].cpu().numpy()
-                # time step associated with the noise level sigmas[i]
-                t_i = utils_model.find_nearest(reduced_alpha_cumprod,curr_sigma)
-                # skip iters
+                # Pas de temps t_i correspondant au niveau de bruit courant
+                t_i = utils_model.find_nearest(reduced_alpha_cumprod, curr_sigma)
                 if t_i > config.t_start:
-                    continue
-                # repeat for semantic consistence: from repaint
+                    continue  # saute les pas au-dessus du point de départ
+                # Itérations internes (iter_num_U > 1 : stratégie RepaintPaper)
                 for u in range(config.iter_num_U):
                     # --------------------------------
-                    # step 1, reverse diffsuion step
+                    # Étape 1 : pas de diffusion inverse → estime x0
                     # --------------------------------
 
-                    # add noise, make the image noise level consistent in pixel level
                     if config.task == "inpaint":
                         if config.generate_mode == 'repaint':
+                            # RePaint : remplace les pixels connus par y bruité au niveau t_i
+                            # Assure la cohérence des pixels observés tout au long de la trajectoire.
                             x = (sqrt_alphas_cumprod[t_i] * (2*y-1) + sqrt_1m_alphas_cumprod[t_i] * torch.randn_like(x)) * mask \
                                     + (1-mask) * x
 
@@ -378,35 +492,38 @@ def main():
                         #       model_out_type=model_out_type, diffusion=diffusion, ddim_sample=ddim_sample, alphas_cumprod=alphas_cumprod)
 
                     # --------------------------------
-                    # step 2, closed-form solution / FFT
+                    # Étape 2 : correction par les données (sous-problème HQS)
                     # --------------------------------
 
                     if seq[i] != seq[-1]:
                         if config.generate_mode == 'DiffPIR':
                             if config.sub_1_analytic:
                                 if model_out_type == 'pred_xstart':
-
                                     tau = rhos[t_i].float().repeat(1, 1, 1, 1)
-                                    # when noise level less than given image noise, skip
-                                    if i < config.num_train_timesteps-config.noise_model_t: 
+                                    # Active la correction seulement quand σ_résiduelle > σ_image
+                                    if i < config.num_train_timesteps-config.noise_model_t:
                                         if config.task == "inpaint":
+                                            # Solution close-form : (M⊙y + τ*x0) / (M + τ)
                                             x0_p = (mask * (2*y-1) + tau * x0).div(mask + tau)
                                             x0 = x0 + config.guidance_scale * (x0_p-x0)
                                         elif config.task == "deblur" or config.sr_mode == 'blur':
+                                            # Déconvolution FFT (voir utils_sisr.data_solution)
                                             x0_p = x0 / 2 + 0.5
                                             x0_p = sr.data_solution(x0_p.float(), FB, FBC, F2B, FBFy, tau, config.sf)
                                             x0_p = x0_p * 2 - 1
-                                            # effective x0
                                             x0 = x0 + config.guidance_scale * (x0_p-x0)
-                                        elif config.sr_mode == 'cubic': 
-                                            # iterative back-projection (IBP) solution
+                                        elif config.sr_mode == 'cubic':
+                                            # IBP (Iterative Back Projection) pour SR bicubique :
+                                            # x0 ← x0 + γ * A^T(y - A(x0)) / (1+ρ)
+                                            # inIter itérations, γ est le pas d'IBP.
                                             for _ in range(config.inIter):
                                                 x0 = x0 / 2 + 0.5
                                                 x0 = x0 + config.gamma * up_sample((y - degrade_op(x0))) / (1+rhos[t_i])
                                                 x0 = x0 * 2 - 1
                                     else:
+                                        # Niveau de bruit trop bas → repasse en mode pred_x_prev
                                         model_out_type = 'pred_x_prev'
-                                        x0 = utils_model.model_fn(x, noise_level=curr_sigma*255,model_out_type=model_out_type, \
+                                        x0 = utils_model.model_fn(x, noise_level=curr_sigma*255, model_out_type=model_out_type, \
                                                 model_diffusion=model, diffusion=diffusion, ddim_sample=config.ddim_sample, alphas_cumprod=alphas_cumprod)
                                         # x0 = utils_model.test_mode(utils_model.model_fn, model, x, mode=2, refield=32, min_size=256, modulo=16, noise_level=curr_sigma*255, \
                                         #       model_out_type=model_out_type, diffusion=diffusion, ddim_sample=config.ddim_sample, alphas_cumprod=alphas_cumprod)
@@ -444,24 +561,29 @@ def main():
                                 x = x.detach_()
                                 pass
                         
-                    # add noise back to t=i-1
+                    # --------------------------------
+                    # Re-bruitage vers t_{i-1} : formule DDIM généralisée (Eq. 12 de l'article)
+                    # x_{t-1} = √ᾱ_{t-1}*x0 + √(1-ζ)*(direction_DDIM + bruit_eta) + √ζ*bruit_pur
+                    # --------------------------------
                     if ((config.task == "inpaint" or config.generate_mode == 'DiffPIR') and model_out_type == 'pred_xstart') and not (seq[i] == seq[-1] and u == config.iter_num_U-1):
-                        #x = sqrt_alphas_cumprod[t_i] * (x0) + (sqrt_1m_alphas_cumprod[t_i]) *  torch.randn_like(x)
-                        
-                        t_im1 = utils_model.find_nearest(reduced_alpha_cumprod,sigmas[seq[i+1]].cpu().numpy())
-                        # calculate \hat{\eposilon}
+                        t_im1 = utils_model.find_nearest(reduced_alpha_cumprod, sigmas[seq[i+1]].cpu().numpy())
+                        # ε̂ estimé depuis x_t et x0 prédit
                         eps = (x - sqrt_alphas_cumprod[t_i] * x0) / sqrt_1m_alphas_cumprod[t_i]
+                        # η contrôle la variance du bruit DDIM (0 = déterministe)
                         eta_sigma = config.eta * sqrt_1m_alphas_cumprod[t_im1] / sqrt_1m_alphas_cumprod[t_i] * torch.sqrt(betas[t_i])
-                        x = sqrt_alphas_cumprod[t_im1] * x0 + np.sqrt(1-config.zeta) * (torch.sqrt(sqrt_1m_alphas_cumprod[t_im1]**2 - eta_sigma**2) * eps \
-                                    + eta_sigma * torch.randn_like(x)) + np.sqrt(config.zeta) * sqrt_1m_alphas_cumprod[t_im1] * torch.randn_like(x)
+                        # ζ mélange la direction déterministe avec du bruit i.i.d. pur
+                        x = sqrt_alphas_cumprod[t_im1] * x0 + \
+                            np.sqrt(1-config.zeta) * (torch.sqrt(sqrt_1m_alphas_cumprod[t_im1]**2 - eta_sigma**2) * eps \
+                                + eta_sigma * torch.randn_like(x)) + \
+                            np.sqrt(config.zeta) * sqrt_1m_alphas_cumprod[t_im1] * torch.randn_like(x)
                     else:
-                        #x = x0
                         pass
-                        
-                    # set back to x_t from x_{t-1}
+
+                    # Retour en arrière pour les itérations internes (iter_num_U > 1) :
+                    # ré-bruite x_{t-1} vers x_t pour repartir de x_t à l'itération suivante.
                     if u < config.iter_num_U-1 and seq[i] != seq[-1]:
-                        ### it's equivalent to use x & xt (?), but with xt the computation is faster.
-                        # x = torch.sqrt(alphas[t_i]) * x + torch.sqrt(betas[t_i]) * torch.randn_like(x)
+                        # Formule exacte du processus forward q(x_t | x_{t-1}) via la décomposition
+                        # de la variance : plus stable numériquement que l'ajout direct de β_t.
                         sqrt_alpha_effective = sqrt_alphas_cumprod[t_i] / sqrt_alphas_cumprod[t_im1]
                         x = sqrt_alpha_effective * x + torch.sqrt(sqrt_1m_alphas_cumprod[t_i]**2 - \
                                 sqrt_alpha_effective**2 * sqrt_1m_alphas_cumprod[t_im1]**2) * torch.randn_like(x)

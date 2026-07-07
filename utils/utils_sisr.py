@@ -1,3 +1,17 @@
+# utils/utils_sisr.py
+#
+# Solveur FFT pour la super-résolution et le défloutage dans DiffPIR.
+#
+# L'étape 2 de DiffPIR résout le sous-problème HQS (Half-Quadratic Splitting) :
+#   min_{x} (1/2σ²) ||Ax - y||² + (ρ/2) ||x - z||²
+# où A est l'opérateur de dégradation (flou + sous-échantillonnage), y l'observation,
+# z = x̂₀ l'estimation de l'image propre depuis le modèle de diffusion, et ρ = λσ²/σ_k².
+#
+# Pour les opérateurs A modélisables par convolution + sous-échantillonnage,
+# la solution analytique s'obtient dans le domaine de Fourier via les fonctions ci-dessous.
+#
+# Référence mathématique : Eq. (12) de l'article DiffPIR et travaux DPIR (Zhang et al., 2021).
+
 # -*- coding: utf-8 -*-
 import torch.fft
 import torch
@@ -7,12 +21,16 @@ from scipy import ndimage
 from scipy.interpolate import interp2d
 
 def splits(a, sf):
-    '''split a into sfxsf distinct blocks
+    '''Découpe le tenseur a en sf×sf blocs distincts et les empile sur la dernière dimension.
+
+    Utilisé dans data_solution pour calculer la moyenne des sous-bandes fréquentielles
+    (équivalent de S^T en notation matricielle pour l'opérateur de sous-échantillonnage).
+
     Args:
         a: NxCxWxH
-        sf: split factor
+        sf: facteur de découpe
     Returns:
-        b: NxCx(W/sf)x(H/sf)x(sf^2)
+        b: NxCx(W/sf)x(H/sf)x(sf²)
     '''
     b = torch.stack(torch.chunk(a, sf, dim=2), dim=4)
     b = torch.cat(torch.chunk(b, sf, dim=3), dim=4)
@@ -20,31 +38,33 @@ def splits(a, sf):
 
 
 def p2o(psf, shape):
-    '''
-    Convert point-spread function to optical transfer function.
-    otf = p2o(psf) computes the Fast Fourier Transform (FFT) of the
-    point-spread function (PSF) array and creates the optical transfer
-    function (OTF) array that is not influenced by the PSF off-centering.
+    '''Convertit une PSF (Point Spread Function) en OTF (Optical Transfer Function).
+    La PSF est zéro-paddée à la taille `shape` puis décalée circulairement pour
+    que son centre soit en position (0,0) avant la FFT — condition nécessaire pour
+    que la convolution circulaire soit exacte sans artefacts de phase.
+
     Args:
-        psf: NxCxhxw
-        shape: [H, W]
+        psf: NxCxhxw  (noyau de flou)
+        shape: [H, W]  (taille de l'image HR)
     Returns:
-        otf: NxCxHxWx2
+        otf: NxCxHxW  (complexe, dans le domaine de Fourier)
     '''
     otf = torch.zeros(psf.shape[:-2] + shape).type_as(psf)
     otf[...,:psf.shape[2],:psf.shape[3]].copy_(psf)
     for axis, axis_size in enumerate(psf.shape[2:]):
         otf = torch.roll(otf, -int(axis_size / 2), dims=axis+2)
     otf = torch.fft.fftn(otf, dim=(-2,-1))
-    #n_ops = torch.sum(torch.tensor(psf.shape).type_as(psf) * torch.log2(torch.tensor(psf.shape).type_as(psf)))
-    #otf[..., 1][torch.abs(otf[..., 1]) < n_ops*2.22e-16] = torch.tensor(0).type_as(psf)
     return otf
 
 
 def upsample(x, sf=3):
-    '''s-fold upsampler
-    Upsampling the spatial size by filling the new entries with zeros
-    x: tensor image, NxCxWxH
+    '''Sur-échantillonnage sf-fold par insertion de zéros (opérateur S^T en SR).
+    Positionne chaque pixel LR au coin supérieur gauche de son patch HR.
+
+    Args:
+        x: NxCxWxH (image LR)
+    Returns:
+        z: NxCx(W*sf)x(H*sf) (image HR zéro-paddée)
     '''
     st = 0
     z = torch.zeros((x.shape[0], x.shape[1], x.shape[2]*sf, x.shape[3]*sf)).type_as(x)
@@ -53,9 +73,13 @@ def upsample(x, sf=3):
 
 
 def downsample(x, sf=3):
-    '''s-fold downsampler
-    Keeping the upper-left pixel for each distinct sfxsf patch and discarding the others
-    x: tensor image, NxCxWxH
+    '''Sous-échantillonnage sf-fold par sélection d'un pixel sur sf (opérateur S).
+    Garde le pixel en position (0,0) de chaque patch sf×sf.
+
+    Args:
+        x: NxCxWxH (image HR)
+    Returns:
+        image LR : NxCx(W//sf)x(H//sf)
     '''
     st = 0
     return x[..., st::sf, st::sf]
@@ -63,10 +87,32 @@ def downsample(x, sf=3):
 
 
 def data_solution(x, FB, FBC, F2B, FBFy, alpha, sf):
+    '''
+    Solution analytique dans le domaine de Fourier pour le sous-problème HQS en SR.
+    Résout : (B^T B + α I) x_out = B^T y + α x
+    en exploitant la diagonalisation de l'opérateur B dans le domaine de Fourier.
+
+    Formule (domaine de Fourier, après la propriété de sous-échantillonnage) :
+      X_out = (F(α*x) + FBFy) / (F2B/sf² + α)
+    où F2B/sf² est la somme des sous-bandes de |F(B)|².
+
+    Args :
+      x     : estimation courante x̂₀ ∈ [0,1], NxCxHxW
+      FB    : TF du noyau B = F(k) zéro-paddé à taille HR
+      FBC   : conjugué de FB
+      F2B   : |FB|² = FB * FBC
+      FBFy  : FBC * F(S^T y)  (pré-calculé une fois pour toutes)
+      alpha : ρ[t], paramètre de régularisation (scalaire ou (1,1,1,1))
+      sf    : facteur d'échelle SR
+    Returns :
+      Xest  : image restaurée ∈ [0,1], NxCxHxW
+    '''
     FR = FBFy + torch.fft.fftn(alpha*x, dim=(-2,-1))
     x1 = FB.mul(FR)
+    # Moyenne des sf² sous-bandes : réalise l'opération S S^T dans le domaine fréquentiel
     FBR = torch.mean(splits(x1, sf), dim=-1, keepdim=False)
     invW = torch.mean(splits(F2B, sf), dim=-1, keepdim=False)
+    # Division fréquentielle : invW + alpha est le dénominateur diagonalisé
     invWBR = FBR.div(invW + alpha)
     FCBinvWBR = FBC*invWBR.repeat(1, 1, sf, sf)
     FX = (FR-FCBinvWBR)/alpha
@@ -77,51 +123,57 @@ def data_solution(x, FB, FBC, F2B, FBFy, alpha, sf):
 
 def pre_calculate(x, k, sf):
     '''
+    Pré-calcule les matrices FFT réutilisées à chaque pas de diffusion.
+    À appeler une seule fois avant la boucle principale pour économiser du calcul.
+
     Args:
-        x: NxCxHxW, LR input
-        k: NxCxhxw
-        sf: integer
+        x:  NxCxHxW, image LR (observation y)
+        k:  NxCxhxw, noyau de flou (doit avoir les bonnes dimensions pour le batch)
+        sf: facteur d'échelle SR (1 pour le défloutage seul)
 
     Returns:
-        FB, FBC, F2B, FBFy
-        will be reused during iterations
+        FB   : TF du noyau B sur la grille HR (NxCxH*sf x W*sf, complexe)
+        FBC  : conjugué de FB
+        F2B  : |FB|² (puissance spectrale du noyau)
+        FBFy : FBC * F(S^T y)  (terme constant de la solution, dépend seulement de y)
     '''
     w, h = x.shape[-2:]
     FB = p2o(k, (w*sf, h*sf))
     FBC = torch.conj(FB)
     F2B = torch.pow(torch.abs(FB), 2)
-    STy = upsample(x, sf=sf)
-    FBFy = FBC*torch.fft.fftn(STy, dim=(-2, -1))
+    STy = upsample(x, sf=sf)                        # S^T y : y upsamplé par insertion de zéros
+    FBFy = FBC*torch.fft.fftn(STy, dim=(-2, -1))   # F(B)^* * F(S^T y)
     return FB, FBC, F2B, FBFy
 
 
 
 
 def classical_degradation(x, k, sf=3):
-    ''' blur + downsampling
+    '''Dégradation classique SR : convolution avec k puis sous-échantillonnage.
 
     Args:
-        x: HxWxC image, [0, 1]/[0, 255]
-        k: hxw, double
-        sf: down-scale factor
-
-    Return:
-        downsampled LR image
+        x: HxWxC, image HR [0,1] ou [0,255]
+        k: hxw, noyau de flou (double)
+        sf: facteur de sous-échantillonnage
+    Returns:
+        image LR sous-échantillonnée
     '''
     x = ndimage.filters.convolve(x, np.expand_dims(k, axis=2), mode='wrap')
-    #x = filters.correlate(x, np.expand_dims(np.flip(k), axis=2))
     st = 0
     return x[st::sf, st::sf, ...]
 
 
 
 def shift_pixel(x, sf, upper_left=True):
-    """shift pixel for super-resolution with different scale factors
+    '''Décale les pixels pour la SR classique afin d'aligner le pixel LR
+    avec le centre de son patch HR (correction du demi-pixel introduit par
+    certaines conventions de sous-échantillonnage).
+
     Args:
-        x: WxHxC or WxH, image or kernel
-        sf: scale factor
-        upper_left: shift direction
-    """
+        x: WxHxC ou WxH (image ou noyau)
+        sf: facteur d'échelle
+        upper_left: si True, décale vers le haut-gauche ; sinon vers le bas-droite
+    '''
     h, w = x.shape[:2]
     shift = (sf-1)*0.5
     xv, yv = np.arange(0, w, 1.0), np.arange(0, h, 1.0)

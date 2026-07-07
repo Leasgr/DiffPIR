@@ -1,7 +1,16 @@
+# utils/utils_inpaint.py
+#
+# Utilitaires pour la tâche d'inpainting (complétion d'image masquée).
+#
+# Composants principaux :
+#   mask_generator : génère des masques binaires selon différentes stratégies
+#   get_rho_sigma  : calcule les paramètres rho/sigma pour le schedule HQS (non utilisé dans DiffPIR)
+#   shepard_initialize : interpolation de Shepard pour initialiser les pixels manquants
+
 # -*- coding: utf-8 -*-
 import numpy as np
 import torch
-from utils import utils_image as util 
+from utils import utils_image as util
 
 '''
 modified by Kai Zhang (github: https://github.com/cszn)
@@ -10,7 +19,7 @@ modified by Kai Zhang (github: https://github.com/cszn)
 
 
 # --------------------------------
-# get rho and sigma
+# get rho and sigma (héritage DPIR, non utilisé dans DiffPIR)
 # --------------------------------
 def get_rho_sigma(sigma=2.55/255, iter_num=15, modelSigma2=2.55):
     '''
@@ -62,11 +71,13 @@ def shepard_initialize(image, measurement_mask, window=5, p=2):
 
     return x
 
-### Mask generator from https://github.com/DPS2022/diffusion-posterior-sampling/
+### Générateur de masques (adapté de https://github.com/DPS2022/diffusion-posterior-sampling/)
+# Convention des masques : 1 = pixel CONNU (conservé), 0 = pixel INCONNU (à reconstruire)
 
 def random_sq_bbox(img, mask_shape, image_size=256, margin=(16, 16)):
-    """Generate a random sqaure mask for inpainting
-    """
+    '''Génère un masque avec un rectangle de pixels inconnus (0) positionné aléatoirement.
+    La marge garantit que le rectangle ne touche pas les bords de l'image.
+    '''
     B, C, H, W = img.shape
     h, w = mask_shape
     margin_height, margin_width = margin
@@ -84,14 +95,21 @@ def random_sq_bbox(img, mask_shape, image_size=256, margin=(16, 16)):
     return mask, t, t+h, l, l+w
 
 class mask_generator:
+    '''Génère des masques d'inpainting selon différentes stratégies.
+
+    Paramètres :
+      mask_type       : 'box'     → rectangle de pixels inconnus (simule une occlusion)
+                        'random'  → pixels individuels masqués aléatoirement (bruit sel/poivre)
+                        'both'    → combinaison box + random (non implémenté dans __call__)
+                        'extreme' → inverse du 'box' (seul le rectangle est connu)
+      mask_len_range  : [min, max] taille du côté du rectangle pour 'box' (en pixels)
+      mask_prob_range : [min, max] probabilité qu'un pixel soit masqué pour 'random'
+                        [0.5, 0.5] = 50% des pixels masqués
+      image_size      : taille de l'image carrée (256 par défaut)
+      margin          : marge depuis les bords pour positionner le rectangle 'box'
+    '''
     def __init__(self, mask_type, mask_len_range=None, mask_prob_range=None,
                  image_size=256, margin=(16, 16)):
-        """
-        (mask_len_range): given in (min, max) tuple.
-        Specifies the range of box size in each dimension
-        (mask_prob_range): for the case of random masking,
-        specify the probability of individual pixels being masked
-        """
         assert mask_type in ['box', 'random', 'both', 'extreme']
         self.mask_type = mask_type
         self.mask_len_range = mask_len_range

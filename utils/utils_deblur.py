@@ -1,3 +1,20 @@
+# utils/utils_deblur.py
+#
+# Utilitaires pour la tâche de défloutage dans DiffPIR.
+#
+# Composants principaux :
+#   MotionBlurOperator   : opérateur de flou de mouvement (trajectoire aléatoire)
+#   GaussialBlurOperator : opérateur de flou gaussien isotrope
+#   Blurkernel           : module PyTorch implémentant la convolution de flou
+#   blurkernel_synthesis : génère un noyau de flou synthétique aléatoire (pré-DPS)
+#   psf2otf / p2o        : conversion PSF → OTF pour le calcul FFT
+#   wrap_boundary_liu    : extension périodique de l'image pour éviter les artefacts de bords
+#
+# Note sur les opérateurs de flou :
+#   Le padding réflexif (ReflectionPad2d) est utilisé pour éviter les artefacts de bords
+#   lors de la convolution en mode 'spatial'. La solution FFT dans utils_sisr.py suppose
+#   quant à elle une convolution circulaire (mode='wrap' dans scipy).
+
 # -*- coding: utf-8 -*-
 import numpy as np
 import scipy
@@ -639,6 +656,16 @@ from https://github.com/DPS2022/diffusion-posterior-sampling
 
 
 class Blurkernel(nn.Module):
+    '''Module PyTorch implémentant une convolution de flou (gaussien ou mouvement).
+    Utilise un padding réflexif (ReflectionPad2d) pour réduire les artefacts de bords.
+    La convolution est appliquée indépendamment sur chaque canal (groups=3).
+
+    Paramètres :
+      blur_type   : 'gaussian' ou 'motion'
+      kernel_size : taille du noyau en pixels (doit être impair, ex: 31, 61)
+      std         : écart-type pour 'gaussian' (pixels) ou intensité pour 'motion'
+      device      : dispositif PyTorch ('cuda' ou 'cpu')
+    '''
     def __init__(self, blur_type='gaussian', kernel_size=31, std=3.0, device=None):
         super().__init__()
         self.blur_type = blur_type
@@ -681,6 +708,14 @@ class Blurkernel(nn.Module):
         return self.k
 
 class MotionBlurOperator():
+    '''Opérateur de flou de mouvement basé sur une trajectoire aléatoire.
+
+    Paramètres :
+      kernel_size : taille du noyau carré (pixels). Plus grand = flou plus étendu.
+      intensity   : intensité du mouvement (contrôle la longueur de la trajectoire).
+                    Valeur typique : 0.5 (paramètre kernel_std dans les scripts principaux).
+      device      : dispositif PyTorch
+    '''
     def __init__(self, kernel_size, intensity, device):
         self.device = device
         self.kernel_size = kernel_size
@@ -707,6 +742,14 @@ class MotionBlurOperator():
 
 
 class GaussialBlurOperator():
+    '''Opérateur de flou gaussien isotrope.
+
+    Paramètres :
+      kernel_size : taille du noyau carré (pixels, doit être impair).
+      intensity   : écart-type σ du filtre gaussien (pixels).
+                    Valeur réelle = kernel_std * rand() * 2 + 1 (varie par image si use_DIY_kernel).
+      device      : dispositif PyTorch
+    '''
     def __init__(self, kernel_size, intensity, device):
         self.device = device
         self.kernel_size = kernel_size
