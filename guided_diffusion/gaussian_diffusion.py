@@ -23,6 +23,20 @@ def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
     in the limit of num_diffusion_timesteps.
     Beta schedules may be added, but should not be removed or changed once
     they are committed to maintain backwards compatibility.
+
+    Paramètre d'entraînement — `schedule_name` ("linear" ou "cosine") et
+    `num_diffusion_timesteps` définissent la quantité et l'intensité du
+    bruit ajouté à chaque étape (betas). Ces valeurs déterminent le
+    schedule que le modèle apprend à inverser : elles font partie de
+    l'objet GaussianDiffusion et DOIVENT rester identiques entre le
+    pré-entraînement et le fine-tuning. Par exemple, les checkpoints
+    256x256_diffusion_uncond et diffusion_ffhq_10m utilisés dans ce dépôt
+    (voir main_ddpir.py) ont été pré-entraînés avec noise_schedule="linear"
+    et diffusion_steps=1000 (via script_util.create_gaussian_diffusion) :
+    pour fine-tuner sur des images satellites, garder ces mêmes valeurs.
+    Changer le schedule sans repartir from scratch casserait la
+    correspondance entre les poids du UNet et le bruit qu'il a appris à
+    prédire à chaque timestep.
     """
     if schedule_name == "linear":
         # Linear schedule from Ho et al, extended to work for any number of
@@ -113,6 +127,37 @@ class GaussianDiffusion:
     :param rescale_timesteps: if True, pass floating point timesteps into the
                               model so that they are always scaled like in the
                               original paper (0 to 1000).
+
+    Ces 5 paramètres définissent la "recette" de diffusion utilisée pour
+    entraîner (et donc pour fine-tuner) le modèle. Ils sont construits par
+    script_util.create_gaussian_diffusion à partir des defaults de
+    diffusion_defaults() et doivent correspondre à la configuration du
+    checkpoint de départ :
+
+    - betas : dérivé de (noise_schedule, diffusion_steps). Voir
+      get_named_beta_schedule ci-dessus.
+    - model_mean_type : ModelMeanType.EPSILON si predict_xstart=False (le
+      modèle prédit le bruit ε ajouté, cas standard des checkpoints DDPM
+      utilisés ici), ou ModelMeanType.START_X si predict_xstart=True (le
+      modèle prédit directement x_0). Doit matcher exactement ce que le
+      checkpoint pré-entraîné a appris à prédire.
+    - model_var_type : ModelVarType.LEARNED_RANGE si learn_sigma=True (le
+      UNet produit 2*out_channels canaux : moyenne + variance apprise,
+      c'est le cas de 256x256_diffusion_uncond), sinon FIXED_LARGE/
+      FIXED_SMALL (variance fixée analytiquement, le UNet ne produit que
+      out_channels canaux). Ce choix change la forme de sortie attendue du
+      UNet (voir unet.py, out_channels = 3 ou 6) : une incohérence ici fait
+      planter le chargement du checkpoint ou le calcul de la loss.
+    - loss_type : MSE/RESCALED_MSE (loss simple sur le bruit prédit, terme
+      VB optionnel si learn_sigma) ou KL/RESCALED_KL (loss variationnelle
+      complète, plus coûteuse). Pour un fine-tuning, garder le loss_type
+      utilisé au pré-entraînement (typiquement RESCALED_MSE si use_kl=False
+      et rescale_learned_sigmas=True).
+    - rescale_timesteps : si True, les timesteps entiers [0, num_timesteps)
+      sont convertis en flottants sur une échelle [0, 1000) avant d'être
+      passés au UNet (voir _scale_timesteps). Doit matcher la valeur
+      utilisée au pré-entraînement, sinon l'embedding de timestep du UNet
+      reçoit des valeurs hors de la distribution qu'il a apprise.
     """
 
     def __init__(
@@ -753,6 +798,16 @@ class GaussianDiffusion:
         :param noise: if specified, the specific Gaussian noise to try to remove.
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
+
+        C'est cette fonction que TrainLoop.forward_backward (train_util.py)
+        appelle à chaque step : elle bruite x_start au timestep t (q_sample),
+        fait prédire au modèle le bruit/x_0 correspondant, puis calcule la
+        loss (MSE sur epsilon, + terme VB si la variance est apprise). Pour
+        du fine-tuning sur des images satellites, aucun paramètre de cette
+        fonction n'est à modifier directement : ce sont les hyperparamètres
+        passés à GaussianDiffusion.__init__ (model_mean_type, model_var_type,
+        loss_type) qui pilotent son comportement, et batch_size/lr côté
+        TrainLoop qui pilotent la dynamique d'entraînement.
         """
         if model_kwargs is None:
             model_kwargs = {}

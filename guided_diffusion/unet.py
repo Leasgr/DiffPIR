@@ -422,6 +422,64 @@ class UNetModel(nn.Module):
     :param resblock_updown: use residual blocks for up/downsampling.
     :param use_new_attention_order: use a different attention pattern for potentially
                                     increased efficiency.
+
+    Paramètres d'architecture et fine-tuning sur satellite RGB 256x256 :
+
+    Contrairement aux hyperparamètres d'optimisation (lr, batch_size...),
+    TOUS les paramètres ci-dessous définissent la structure du réseau. Pour
+    charger un checkpoint pré-entraîné (state_dict) et le fine-tuner, il
+    faut reconstruire ce UNetModel avec EXACTEMENT la même architecture que
+    celle utilisée au pré-entraînement, sinon `model.load_state_dict(...)`
+    échoue (formes de tenseurs incompatibles). Ce dépôt utilise déjà ces
+    configs dans main_ddpir.py (via model_config) :
+
+    - image_size=256, in_channels=3, out_channels=3 (ou 6 si learn_sigma) :
+      images satellites RGB → in_channels=3 convient tel quel (pas de
+      canal alpha ni multispectral ici). Ne pas changer image_size sans
+      repartir from scratch : c'est utilisé pour calculer les résolutions
+      d'attention (voir attention_ds dans script_util.create_model) et la
+      profondeur du réseau, pas juste la taille d'entrée.
+    - model_channels : largeur de base du réseau. 128 pour le checkpoint
+      léger "diffusion_ffhq_10m" (~10M paramètres), 256 pour
+      "256x256_diffusion_uncond" (~550M paramètres, entraîné sur ImageNet).
+      Pour fine-tuner, reprendre la valeur du checkpoint choisi.
+    - num_res_blocks : nombre de blocs résiduels par niveau de résolution
+      (1 pour diffusion_ffhq_10m, 2 pour 256x256_diffusion_uncond).
+    - attention_resolutions : facteurs de sous-échantillonnage auxquels
+      l'attention spatiale est appliquée ("16" pour diffusion_ffhq_10m,
+      "8,16,32" pour 256x256_diffusion_uncond, cf. script_util.create_model
+      qui convertit ces chaînes en downsampling ratios).
+    - channel_mult : multiplicateurs de canaux par niveau; pour
+      image_size=256, script_util.create_model fixe automatiquement
+      channel_mult=(1,1,2,2,4,4) si non spécifié — c'est déjà la bonne
+      valeur pour des images satellites 256x256, pas besoin d'y toucher.
+    - num_classes : None pour un modèle non conditionné par classe (cas
+      typique pour un dataset satellite non annoté). Si les images
+      satellites sont annotées par type de terrain, on peut passer au
+      class-conditionnel, mais cela change l'architecture (ajout de
+      label_emb) et empêche de repartir directement d'un checkpoint
+      inconditionnel sans réinitialiser cette partie.
+    - dropout : taux de dropout dans les ResBlock (0.0 par défaut, donc
+      aucun au pré-entraînement). Sur un petit dataset satellite (risque de
+      surapprentissage), augmenter légèrement dropout (ex: 0.1) pendant le
+      fine-tuning peut aider à régulariser — c'est l'un des rares
+      paramètres d'architecture qu'on peut modifier sans casser le
+      chargement du state_dict (le Dropout n'a pas de poids appris).
+    - use_checkpoint : active le gradient checkpointing (recompute des
+      activations pendant le backward au lieu de les garder en mémoire).
+      À activer (True) pour fine-tuner un gros modèle (ex:
+      256x256_diffusion_uncond, ~550M paramètres) sur un GPU à VRAM
+      limitée : réduit fortement la mémoire au prix d'un peu de temps de
+      calcul supplémentaire.
+    - use_fp16 : entraînement/inférence en précision mixte. Combiné à
+      use_fp16=True côté TrainLoop (train_util.py), réduit encore la
+      mémoire et accélère l'entraînement sur GPU récents.
+    - num_heads / num_head_channels : nombre de têtes d'attention (ou
+      largeur fixe par tête si num_head_channels != -1). À garder identique
+      au checkpoint pré-entraîné.
+    - use_scale_shift_norm, resblock_updown, use_new_attention_order :
+      détails d'implémentation des blocs résiduels/attention; à garder
+      identiques au checkpoint pour la compatibilité du state_dict.
     """
 
     def __init__(

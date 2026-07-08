@@ -2,6 +2,21 @@
 Helpers for various likelihood-based losses. These are ported from the original
 Ho et al. diffusion models codebase:
 https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/utils.py
+
+Rôle dans l'entraînement / fine-tuning :
+Ces deux fonctions (normal_kl, discretized_gaussian_log_likelihood) ne sont
+utilisées que par GaussianDiffusion._vb_terms_bpd (gaussian_diffusion.py),
+c'est-à-dire uniquement quand la variance du modèle est apprise
+(model_var_type = LEARNED ou LEARNED_RANGE, i.e. learn_sigma=True côté
+script_util) et/ou quand loss_type inclut un terme KL (LossType.KL/
+RESCALED_KL, ou le terme "vb" additionnel des LossType.MSE/RESCALED_MSE).
+
+Pour un fine-tuning sur satellite RGB 256x256 avec le checkpoint
+256x256_diffusion_uncond (learn_sigma=True), ce module reste actif tel
+quel : il n'y a aucun paramètre ici à ajuster pour le nouveau dataset — ce
+sont les hyperparamètres de plus haut niveau (learn_sigma, use_kl,
+rescale_learned_sigmas dans script_util.diffusion_defaults) qui contrôlent
+si/comment ces fonctions sont utilisées pendant le calcul de la loss.
 """
 
 import numpy as np

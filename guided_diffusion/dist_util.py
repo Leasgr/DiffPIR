@@ -7,7 +7,7 @@ import os
 import socket
 
 import blobfile as bf
-from mpi4py import MPI
+from .mpi_util import MPI  # mpi4py si disponible, sinon shim mono-processus
 import torch as th
 import torch.distributed as dist
 
@@ -28,6 +28,23 @@ def setup_dist():
 
     comm = MPI.COMM_WORLD
     backend = "gloo" if not th.cuda.is_available() else "nccl"
+
+    if comm.Get_size() == 1:
+        # Entrainement mono-processus (pas de vrai MPI, cf. mpi_util.py) :
+        # on n'initialise PAS de process group torch.distributed du tout.
+        # Sur certaines machines (notamment Windows, ou des VM/conteneurs
+        # avec un nom d'hote/reseau atypique - VPN, Docker Desktop, hostname
+        # avec caracteres accentues...), le backend gloo peut echouer a
+        # creer son "device" reseau interne des la construction du process
+        # group (erreur "unsupported gloo device"), meme en rendez-vous
+        # local par fichier et meme pour un seul processus - ce n'est donc
+        # pas la peine d'essayer. Comme un seul processus n'a de toute
+        # facon personne avec qui communiquer, train_util.py et
+        # dist_util.sync_params() detectent l'absence de process group
+        # (dist.is_initialized() == False) et sautent simplement les
+        # appels broadcast/barrier/get_rank/get_world_size (no-op
+        # equivalent a rank=0, world_size=1).
+        return
 
     if backend == "gloo":
         hostname = "localhost"
@@ -78,6 +95,9 @@ def sync_params(params):
     """
     Synchronize a sequence of Tensors across ranks from rank 0.
     """
+    if not dist.is_initialized():
+        # Mono-processus (voir setup_dist) : rien a synchroniser.
+        return
     for p in params:
         with th.no_grad():
             dist.broadcast(p, 0)

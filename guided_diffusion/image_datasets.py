@@ -3,7 +3,7 @@ import random
 
 from PIL import Image
 import blobfile as bf
-from mpi4py import MPI
+from .mpi_util import MPI  # mpi4py si disponible, sinon shim mono-processus
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
 
@@ -35,6 +35,38 @@ def load_data(
     :param deterministic: if True, yield results in a deterministic order.
     :param random_crop: if True, randomly crop the images for augmentation.
     :param random_flip: if True, randomly flip the images for augmentation.
+
+    Adaptation pour un dataset d'images satellites RGB 256x256 :
+
+    - data_dir : dossier contenant les images (recherche récursive via
+      _list_image_files_recursively). Seules les extensions jpg/jpeg/png/gif
+      sont reconnues (voir plus bas) : si les images satellites sont
+      fournies en GeoTIFF (.tif/.tiff), il faut d'abord les convertir en
+      PNG/JPEG (et gérer séparément la géoréférence, non conservée ici).
+    - batch_size : voir train_util.TrainLoop (paramètre `batch_size` du
+      TrainLoop, transmis tel quel ici).
+    - image_size : mettre 256 pour matcher la résolution native du
+      checkpoint fine-tuné (ex: 256x256_diffusion_uncond) et celle du
+      dataset satellite. Si les tuiles satellites ne sont pas déjà en
+      256x256, ImageDataset redimensionne/recadre automatiquement
+      (center_crop_arr ou random_crop_arr) — voir plus bas.
+    - class_cond : False pour un dataset satellite non étiqueté (cas
+      général). Si mis à True, le nom de fichier doit commencer par
+      "<classe>_..." (ex: "foret_0001.jpg", "urbain_0002.jpg") : le préfixe
+      avant le premier "_" sert de label de classe. Doit être cohérent avec
+      num_classes/class_cond côté script_util.create_model.
+    - deterministic : False pendant l'entraînement (shuffle=True souhaité
+      pour bien mélanger les tuiles satellites à chaque epoch); utile à
+      True uniquement pour une évaluation reproductible.
+    - random_crop : True augmente la diversité en recadrant aléatoirement
+      entre 80% et 100% de la taille cible (voir random_crop_arr) — utile
+      si le dataset satellite est petit, pour limiter le surapprentissage
+      pendant le fine-tuning.
+    - random_flip : True applique un flip horizontal aléatoire (50%). Les
+      images satellites n'ayant pas d'orientation "haut/bas" privilégiée
+      forte, on peut aussi envisager d'ajouter des rotations 90°/180°/270°
+      en complément (non implémenté ici) pour augmenter davantage un petit
+      dataset satellite, la Terre vue du ciel étant invariante par rotation.
     """
     if not data_dir:
         raise ValueError("unspecified data directory")
@@ -68,6 +100,11 @@ def load_data(
 
 
 def _list_image_files_recursively(data_dir):
+    # Parcourt récursivement data_dir et ne garde que jpg/jpeg/png/gif.
+    # Pour des images satellites en GeoTIFF, ajouter "tif"/"tiff" à cette
+    # liste ne suffit pas : PIL.Image.open (utilisé dans ImageDataset)
+    # gère les TIFF simples mais pas les métadonnées géospatiales; il est
+    # préférable de convertir le dataset en PNG/JPEG en amont.
     results = []
     for entry in sorted(bf.listdir(data_dir)):
         full_path = bf.join(data_dir, entry)
@@ -115,6 +152,12 @@ class ImageDataset(Dataset):
         if self.random_flip and random.random() < 0.5:
             arr = arr[:, ::-1]
 
+        # Normalisation en [-1, 1], convention attendue par GaussianDiffusion
+        # (q_sample, clip_denoised...) et par le UNet pré-entraîné. Ne pas
+        # utiliser une autre normalisation (ex: [0,1] ou standardisation
+        # par moyenne/écart-type du dataset satellite) pour du fine-tuning :
+        # cela romprait la cohérence avec ce que le modèle pré-entraîné a
+        # appris.
         arr = arr.astype(np.float32) / 127.5 - 1
 
         out_dict = {}

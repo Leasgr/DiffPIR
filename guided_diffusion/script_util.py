@@ -11,6 +11,34 @@ NUM_CLASSES = 1000
 def diffusion_defaults():
     """
     Defaults for image and classifier training.
+
+    Ces valeurs par défaut sont celles d'un entraînement DDPM "générique".
+    Pour un FINE-TUNING sur satellite RGB 256x256 à partir d'un checkpoint
+    existant (ex: 256x256_diffusion_uncond.pt, cf. main_ddpir.py), il faut
+    passer les valeurs EXACTES utilisées pour ce checkpoint plutôt que ces
+    défauts, en particulier :
+
+    - learn_sigma : True pour 256x256_diffusion_uncond (le UNet apprend
+      aussi la variance, out_channels=6). Change la forme des poids du
+      dernier layer du UNet (voir unet.py, UNetModel.out) : une valeur
+      erronée empêche load_state_dict de fonctionner.
+    - diffusion_steps : 1000, nombre total d'étapes du processus de
+      diffusion (voir gaussian_diffusion.get_named_beta_schedule). Ne pas
+      changer par rapport au pré-entraînement.
+    - noise_schedule : "linear" (utilisé par les checkpoints de ce dépôt).
+    - timestep_respacing : "" pendant l'entraînement (on utilise les 1000
+      steps complets). Ce paramètre ne sert que pour ACCÉLÉRER
+      l'échantillonnage à l'inférence (DDIM/respacing), pas pour
+      l'entraînement — le laisser vide ("") lors du fine-tuning.
+    - use_kl / rescale_learned_sigmas : déterminent le loss_type (voir
+      create_gaussian_diffusion). Pour 256x256_diffusion_uncond,
+      typiquement use_kl=False et rescale_learned_sigmas=True → loss
+      RESCALED_MSE (MSE sur epsilon + terme VB rescalé pour la variance
+      apprise).
+    - predict_xstart : False si le modèle prédit le bruit epsilon (cas
+      standard), True s'il prédit x_0 directement. Doit matcher le
+      checkpoint pré-entraîné.
+    - rescale_timesteps : False par défaut pour ces checkpoints.
     """
     return dict(
         learn_sigma=False,
@@ -43,6 +71,17 @@ def classifier_defaults():
 def model_and_diffusion_defaults():
     """
     Defaults for image training.
+
+    Fusionne les défauts d'architecture UNet (num_channels, num_res_blocks,
+    attention_resolutions, dropout, class_cond, use_checkpoint, use_fp16...)
+    avec ceux de diffusion_defaults(). Pour fine-tuner sur satellite RGB
+    256x256, partir de ce dict puis écraser au minimum : image_size=256,
+    num_channels, num_res_blocks, attention_resolutions et learn_sigma pour
+    matcher le checkpoint choisi (voir le model_config déjà défini dans
+    main_ddpir.py pour "diffusion_ffhq_10m" vs "256x256_diffusion_uncond").
+    class_cond doit rester cohérent avec image_datasets.load_data
+    (paramètre class_cond) et avec le dataset satellite (généralement non
+    étiqueté → class_cond=False).
     """
     res = dict(
         image_size=64,
@@ -146,6 +185,10 @@ def create_model(
     use_new_attention_order=False,
 ):
     if channel_mult == "":
+        # Pour des images satellites 256x256 (image_size=256), ce bloc fixe
+        # automatiquement channel_mult=(1,1,2,2,4,4), la même valeur que
+        # celle utilisée pour pré-entraîner 256x256_diffusion_uncond : rien
+        # à changer ici tant qu'on garde image_size=256.
         if image_size == 512:
             channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
         elif image_size == 256:
